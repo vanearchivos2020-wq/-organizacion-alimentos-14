@@ -1,8 +1,11 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
 import { supabase } from './supabase'
 
-const SESSION_KEY = 'alimentos_session'
-const SESSION_HOURS = 12
+// Usuario único de la app en Supabase Auth. La base (RLS) solo deja pasar a este usuario.
+const APP_EMAIL = 'organizacion@lachacra.app'
+// Supabase pide contraseñas de 6+ caracteres: lo que se escribe en pantalla (ej. 1928)
+// se manda como "organizacion-1928".
+const toAuthPassword = (pwd: string) => `organizacion-${pwd}`
 
 interface AuthContextValue {
   isAuthenticated: boolean
@@ -15,68 +18,65 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null)
 
-function hasValidSession(): boolean {
-  const raw = localStorage.getItem(SESSION_KEY)
-  if (!raw) return false
-  const expiresAt = Number(raw)
-  if (Number.isNaN(expiresAt)) return false
-  return Date.now() < expiresAt
-}
-
-function setSession() {
-  const expiresAt = Date.now() + SESSION_HOURS * 60 * 60 * 1000
-  localStorage.setItem(SESSION_KEY, String(expiresAt))
-}
-
-function clearSession() {
-  localStorage.removeItem(SESSION_KEY)
-}
-
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    setIsAuthenticated(hasValidSession())
-    setLoading(false)
+    localStorage.removeItem('alimentos_session') // marca del login viejo, ya no se usa
+    supabase.auth.getSession().then(({ data }) => {
+      setIsAuthenticated(!!data.session)
+      setLoading(false)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setIsAuthenticated(!!session)
+    })
+    return () => listener.subscription.unsubscribe()
   }, [])
 
   async function login(password: string): Promise<boolean> {
     setError(null)
-    const { data, error: rpcError } = await supabase.rpc('check_site_password', {
-      pwd: password,
+    const { error: authError } = await supabase.auth.signInWithPassword({
+      email: APP_EMAIL,
+      password: toAuthPassword(password),
     })
-    if (rpcError) {
-      setError('No se pudo verificar la contraseña. Revisá la conexión con Supabase.')
+    if (authError) {
+      const msg = (authError.message || '').toLowerCase()
+      setError(
+        msg.includes('invalid') || msg.includes('credentials')
+          ? 'Contraseña incorrecta.'
+          : 'No se pudo verificar la contraseña. Revisá la conexión con Supabase.'
+      )
       return false
     }
-    if (data === true) {
-      setSession()
-      setIsAuthenticated(true)
-      return true
-    }
-    setError('Contraseña incorrecta.')
-    return false
+    setIsAuthenticated(true)
+    return true
   }
 
   function logout() {
-    clearSession()
+    supabase.auth.signOut()
     setIsAuthenticated(false)
   }
 
   async function changePassword(oldPwd: string, newPwd: string) {
-    const { data, error: rpcError } = await supabase.rpc('set_site_password', {
-      old_pwd: oldPwd,
-      new_pwd: newPwd,
+    // Verifica la contraseña actual volviendo a iniciar sesión con ella
+    const { error: checkError } = await supabase.auth.signInWithPassword({
+      email: APP_EMAIL,
+      password: toAuthPassword(oldPwd),
     })
-    if (rpcError) {
+    if (checkError) {
+      const msg = (checkError.message || '').toLowerCase()
+      if (msg.includes('invalid') || msg.includes('credentials')) {
+        return { ok: false, error: 'La contraseña actual no es correcta.' }
+      }
       return { ok: false, error: 'Error de conexión con Supabase.' }
     }
-    if (data === true) {
-      return { ok: true }
+    const { error: updError } = await supabase.auth.updateUser({ password: toAuthPassword(newPwd) })
+    if (updError) {
+      return { ok: false, error: 'No se pudo cambiar la contraseña. Probá con otra (y que no sea igual a la actual).' }
     }
-    return { ok: false, error: 'La contraseña actual no es correcta.' }
+    return { ok: true }
   }
 
   return (
